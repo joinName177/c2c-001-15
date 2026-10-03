@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue';
 import { LocalTimeRepository } from '../adapters/local-time.repository';
-import { CATEGORIES, CATEGORY_META, type TimeCategory } from '../core/models';
+import { CATEGORIES, CATEGORY_META, type TimeCategory, type TimeSnapshot } from '../core/models';
+import { parseBackup, serializeBackup } from '../core/backup';
 import { balanceSheet, metricsFor, portfolioScore, record, sampleSnapshot, suggestions, totalInvested } from '../core/time-engine';
 
 const repo = new LocalTimeRepository();
@@ -22,14 +23,63 @@ function updateAccount() { state.account.dailyHours = Math.max(1, Number(account
 function addRecord() { state.records.unshift(record(draft.category, draft.hours, draft.note)); save(); draft.note = ''; notice.value = '一笔时间投资已入账'; tab.value = '记录'; }
 function removeRecord(id: string) { state.records = state.records.filter((item) => item.id !== id); save(); }
 function resetDemo() { const fresh = sampleSnapshot(); state.account = fresh.account; state.records = fresh.records; save(); notice.value = '已恢复初始示例组合'; }
+
+const fileInput = ref<HTMLInputElement | null>(null);
+const pendingImport = ref<{ snapshot: TimeSnapshot; fileName: string } | null>(null);
+const importError = ref('');
+
+function exportData() {
+  const url = URL.createObjectURL(new Blob([serializeBackup({ account: state.account, records: state.records })], { type: 'application/json' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `time-investment-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+  notice.value = `已导出账户预算与 ${state.records.length} 笔流水`;
+}
+
+function pickImportFile() { importError.value = ''; fileInput.value?.click(); }
+
+async function onImportFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  let text: string;
+  try {
+    text = await file.text();
+  } catch {
+    importError.value = '文件读取失败，请重试';
+    return;
+  }
+  const result = parseBackup(text);
+  if (!result.ok) { pendingImport.value = null; importError.value = result.error; return; }
+  importError.value = '';
+  pendingImport.value = { snapshot: result.snapshot, fileName: file.name };
+}
+
+function confirmImport() {
+  if (!pendingImport.value) return;
+  const { snapshot } = pendingImport.value;
+  state.account = snapshot.account;
+  state.records = snapshot.records;
+  accountDraft.dailyHours = snapshot.account.dailyHours;
+  accountDraft.weeklyHours = snapshot.account.weeklyHours;
+  save();
+  pendingImport.value = null;
+  notice.value = `已导入 ${snapshot.records.length} 笔流水，全部指标已按新数据重新计算`;
+}
+
+function cancelImport() { pendingImport.value = null; }
 </script>
 
 <template>
   <div class="app-shell investment-app">
     <header class="topbar">
       <div class="brand"><div class="brand-mark">时</div><div><span class="eyebrow">LIFE CAPITAL / 01</span><h1>人生时间投资所</h1></div></div>
-      <div class="top-actions"><span class="live-dot">本周账期进行中</span><button class="ghost-button" type="button" @click="resetDemo">↻ 重置演示</button></div>
+      <div class="top-actions"><span class="live-dot">本周账期进行中</span><button class="ghost-button" type="button" @click="exportData">⇩ 导出数据</button><button class="ghost-button" type="button" @click="pickImportFile">⇧ 导入数据</button><button class="ghost-button" type="button" @click="resetDemo">↻ 重置演示</button></div>
     </header>
+    <input ref="fileInput" type="file" accept="application/json,.json" hidden @change="onImportFile" />
     <main class="page-wrap">
       <section class="hero-row">
         <div><p class="eyebrow accent-text">个人时间资产管理台</p><h2>把今天的小时，<em>配置成明天的底气。</em></h2><p class="hero-copy">你的时间不是被消耗的余额，而是一支每天都在重新开盘的投资组合。</p></div>
@@ -51,5 +101,27 @@ function resetDemo() { const fresh = sampleSnapshot(); state.account = fresh.acc
       <section v-else class="content-grid analysis-grid"><article class="panel suggestions-panel"><div class="panel-heading"><div><span class="eyebrow">REBALANCE SIGNALS</span><h3>配置优化建议</h3></div><span class="panel-index">05 / 05</span></div><div class="suggestion-list"><div v-for="(tip, index) in tips" :key="tip" class="suggestion"><span>0{{ index + 1 }}</span><p>{{ tip }}</p><b>→</b></div></div></article><article class="panel roi-panel"><div class="panel-heading"><div><span class="eyebrow">RETURN ON INVESTMENT</span><h3>时间 ROI 分析</h3></div></div><div class="roi-list"><div v-for="item in metrics" :key="item.category" class="roi-row"><div class="roi-name"><i :style="{ background: item.color }"></i><span>{{ item.category }}</span></div><div class="roi-bar"><span :style="{ width: `${item.roi / 2.5 * 100}%`, background: item.color }"></span></div><strong>{{ item.roi.toFixed(2) }}x</strong></div></div><p class="footnote">ROI 是基于精力恢复、能力复利、关系质量与长期机会成本的个人化估算，不代表财务回报。</p></article></section>
       <p v-if="notice && tab !== '记录'" class="toast">{{ notice }}</p>
     </main>
+    <div v-if="pendingImport" class="modal-mask" @click.self="cancelImport">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-label="确认导入备份">
+        <span class="eyebrow">IMPORT BACKUP</span>
+        <h3>确认导入备份文件？</h3>
+        <p class="modal-copy">文件「{{ pendingImport.fileName }}」校验通过。导入将<b>完全覆盖</b>当前浏览器中的账户、预算与全部流水，此操作无法撤销。</p>
+        <div class="modal-compare">
+          <div><span>当前数据</span><strong>{{ state.records.length }} 笔流水</strong><small>每周预算 {{ state.account.weeklyHours }}h</small></div>
+          <b>→</b>
+          <div><span>导入后</span><strong>{{ pendingImport.snapshot.records.length }} 笔流水</strong><small>每周预算 {{ pendingImport.snapshot.account.weeklyHours }}h</small></div>
+        </div>
+        <div class="modal-actions"><button class="ghost-button" type="button" @click="cancelImport">取消</button><button class="danger-button" type="button" @click="confirmImport">覆盖并导入</button></div>
+      </div>
+    </div>
+    <div v-if="importError" class="modal-mask" @click.self="importError = ''">
+      <div class="modal-card" role="alertdialog" aria-modal="true" aria-label="导入失败">
+        <span class="eyebrow">IMPORT FAILED</span>
+        <h3>导入失败</h3>
+        <p class="modal-copy error-text">{{ importError }}</p>
+        <p class="modal-copy">请确认选择的是由本应用导出的备份文件（.json），且文件内容未被修改。</p>
+        <div class="modal-actions"><button class="primary-button" type="button" @click="importError = ''">知道了</button></div>
+      </div>
+    </div>
   </div>
 </template>
