@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, reactive, ref } from 'vue';
 import { LocalTimeRepository } from '../adapters/local-time.repository';
-import { CATEGORIES, CATEGORY_META, type TimeCategory } from '../core/models';
+import { CATEGORIES, CATEGORY_META, type TimeCategory, type TimeSnapshot } from '../core/models';
+import { createBackup, parseBackup } from '../core/backup';
 import { balanceSheet, metricsFor, portfolioScore, record, sampleSnapshot, suggestions, totalInvested } from '../core/time-engine';
 
 const repo = new LocalTimeRepository();
@@ -10,6 +11,9 @@ const notice = ref('');
 const state = reactive(repo.load());
 const accountDraft = reactive({ dailyHours: state.account.dailyHours, weeklyHours: state.account.weeklyHours });
 const draft = reactive({ category: '事业' as TimeCategory, hours: 2, note: '' });
+const fileInput = ref<HTMLInputElement | null>(null);
+const pendingImport = ref<{ snapshot: TimeSnapshot; fileName: string } | null>(null);
+const importError = ref('');
 const metrics = computed(() => metricsFor(state.records));
 const invested = computed(() => totalInvested(state.records));
 const score = computed(() => portfolioScore(metrics.value, state.account));
@@ -22,13 +26,49 @@ function updateAccount() { state.account.dailyHours = Math.max(1, Number(account
 function addRecord() { state.records.unshift(record(draft.category, draft.hours, draft.note)); save(); draft.note = ''; notice.value = '一笔时间投资已入账'; tab.value = '记录'; }
 function removeRecord(id: string) { state.records = state.records.filter((item) => item.id !== id); save(); }
 function resetDemo() { const fresh = sampleSnapshot(); state.account = fresh.account; state.records = fresh.records; save(); notice.value = '已恢复初始示例组合'; }
+function exportBackup() {
+  const blob = new Blob([createBackup({ account: state.account, records: state.records })], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `time-investment-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  notice.value = '备份文件已导出，换设备或清缓存前请妥善保存';
+}
+function triggerImport() { importError.value = ''; fileInput.value?.click(); }
+async function handleFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  try {
+    const result = parseBackup(await file.text());
+    if (!result.ok) { importError.value = result.error; return; }
+    pendingImport.value = { snapshot: result.snapshot, fileName: file.name };
+  } catch {
+    importError.value = '文件读取失败，请重试。';
+  }
+}
+function cancelImport() { pendingImport.value = null; }
+function confirmImport() {
+  if (!pendingImport.value) return;
+  state.account = pendingImport.value.snapshot.account;
+  state.records = pendingImport.value.snapshot.records;
+  accountDraft.dailyHours = state.account.dailyHours;
+  accountDraft.weeklyHours = state.account.weeklyHours;
+  save();
+  notice.value = `已导入 ${state.records.length} 条流水，全部指标已按新数据重新计算`;
+  pendingImport.value = null;
+  tab.value = '总览';
+}
 </script>
 
 <template>
   <div class="app-shell investment-app">
     <header class="topbar">
       <div class="brand"><div class="brand-mark">时</div><div><span class="eyebrow">LIFE CAPITAL / 01</span><h1>人生时间投资所</h1></div></div>
-      <div class="top-actions"><span class="live-dot">本周账期进行中</span><button class="ghost-button" type="button" @click="resetDemo">↻ 重置演示</button></div>
+      <div class="top-actions"><span class="live-dot">本周账期进行中</span><button class="ghost-button" type="button" @click="exportBackup">⇩ 导出备份</button><button class="ghost-button" type="button" @click="triggerImport">⇧ 导入备份</button><button class="ghost-button" type="button" @click="resetDemo">↻ 重置演示</button><input ref="fileInput" type="file" accept=".json,application/json" hidden @change="handleFile" /></div>
     </header>
     <main class="page-wrap">
       <section class="hero-row">
@@ -51,5 +91,22 @@ function resetDemo() { const fresh = sampleSnapshot(); state.account = fresh.acc
       <section v-else class="content-grid analysis-grid"><article class="panel suggestions-panel"><div class="panel-heading"><div><span class="eyebrow">REBALANCE SIGNALS</span><h3>配置优化建议</h3></div><span class="panel-index">05 / 05</span></div><div class="suggestion-list"><div v-for="(tip, index) in tips" :key="tip" class="suggestion"><span>0{{ index + 1 }}</span><p>{{ tip }}</p><b>→</b></div></div></article><article class="panel roi-panel"><div class="panel-heading"><div><span class="eyebrow">RETURN ON INVESTMENT</span><h3>时间 ROI 分析</h3></div></div><div class="roi-list"><div v-for="item in metrics" :key="item.category" class="roi-row"><div class="roi-name"><i :style="{ background: item.color }"></i><span>{{ item.category }}</span></div><div class="roi-bar"><span :style="{ width: `${item.roi / 2.5 * 100}%`, background: item.color }"></span></div><strong>{{ item.roi.toFixed(2) }}x</strong></div></div><p class="footnote">ROI 是基于精力恢复、能力复利、关系质量与长期机会成本的个人化估算，不代表财务回报。</p></article></section>
       <p v-if="notice && tab !== '记录'" class="toast">{{ notice }}</p>
     </main>
+    <div v-if="pendingImport" class="modal-mask" @click.self="cancelImport">
+      <div class="modal-card">
+        <span class="eyebrow">IMPORT BACKUP</span>
+        <h3>导入将覆盖现有数据</h3>
+        <p class="muted">备份文件「{{ pendingImport.fileName }}」包含 <b class="highlight">{{ pendingImport.snapshot.records.length }}</b> 条流水与账户预算（每周 {{ pendingImport.snapshot.account.weeklyHours }} 小时）。</p>
+        <p class="muted">导入后，当前浏览器中的账户、预算与全部 <b class="highlight">{{ state.records.length }}</b> 条流水将被替换，此操作无法撤销。如需保留现有数据，请先取消并导出备份。</p>
+        <div class="modal-actions"><button class="ghost-button bordered" type="button" @click="cancelImport">取消</button><button class="primary-button" type="button" @click="confirmImport">确认覆盖导入 →</button></div>
+      </div>
+    </div>
+    <div v-if="importError" class="modal-mask" @click.self="importError = ''">
+      <div class="modal-card">
+        <span class="eyebrow">IMPORT FAILED</span>
+        <h3 class="error-title">备份文件无法导入</h3>
+        <p class="muted">{{ importError }}</p>
+        <div class="modal-actions"><button class="primary-button" type="button" @click="importError = ''">知道了</button></div>
+      </div>
+    </div>
   </div>
 </template>
