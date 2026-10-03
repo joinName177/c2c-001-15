@@ -1,0 +1,5 @@
+services:
+  life-time-investment:
+    build: .
+    ports:
+      - "8101:80"
